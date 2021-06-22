@@ -1,6 +1,8 @@
 ---
 title: "Prediction assignment"
-output: html_notebook
+output:
+  html_document:
+    df_print: paged
 ---
 
 # Weight lifting exercizes dataset
@@ -22,6 +24,7 @@ And from the review criteria:
 library(plyr)
 library(parallel)
 library(tidyverse)
+library(lubridate)
 library(caret)
 library(doMC)
 registerDoMC(cores=4)
