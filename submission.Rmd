@@ -1,0 +1,247 @@
+---
+title: "Prediction assignment"
+output: html_notebook
+---
+
+# Weight lifting exercizes dataset
+
+As per the [upstream documentation](http://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/har) of the dataset[^1]:
+
+[^1]: [Velloso, E.](https://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/collaborator.jsf?p1=evelloso); Bulling, A.; Gellersen, H.; [Ugulino, W.](https://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/collaborator.jsf?p1=ugulino); [Fuks, H.](https://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/collaborator.jsf?p1=hugo) [**Qualitative Activity Recognition of Weight Lifting Exercises**](https://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/work.jsf?p1=11201 "Qualitative Activity Recognition of Weight Lifting Exercises"). Proceedings of 4th International Conference in Cooperation with SIGCHI (Augmented Human '13) . Stuttgart, Germany: ACM SIGCHI, 2013.
+
+> Six young health participants were asked to perform one set of 10 repetitions of the Unilateral Dumbbell Biceps Curl in five different fashions: exactly according to the specification (Class A), throwing the elbows to the front (Class B), lifting the dumbbell only halfway (Class C), lowering the dumbbell only halfway (Class D) and throwing the hips to the front (Class E).
+
+And from the review criteria:
+
+> \
+> ...This is the "classe" variable in the training set.
+
+## Load data
+
+```{r cache=TRUE}
+library(plyr)
+library(parallel)
+library(tidyverse)
+library(caret)
+library(doMC)
+registerDoMC(cores=4)
+
+training<- readr::read_csv("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv",col_types = cols(.default=col_character()))
+testing<- readr::read_csv("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv",col_types = cols(.default=col_character()))
+
+```
+
+## Clean Data
+
+```{r cache=TRUE}
+training_clean<-training%>%
+    select(-X1)%>%
+    mutate(across(num_window:(ncol(.)-1),~case_when(
+        .x == "#DIV/=" ~ NA_character_,
+        TRUE ~ .x
+    )))%>%
+    mutate(across(num_window:(ncol(.)-1),as.numeric))%>%
+  #First strqategy, drop all columns with na's
+  #  select(where(~!any(is.na(.x))))%>%
+  mutate(classe=as_factor(classe))
+
+#Skim data for relevant variables
+training_clean%>%
+    skimr::skim()->skimdata
+
+# Only variables with >50% non na values
+useful_variables<-skimdata%>%as_tibble()%>%filter(complete_rate>.5)%>%pull(skim_variable)
+
+training_clean<-training_clean%>%
+  select(all_of(useful_variables))
+
+#Create a validation set for out of sample errors
+set.seed(123)
+inTrain<-caret::createDataPartition(y = training_clean$classe,list=F,p = 0.75)
+validation<-training_clean[-inTrain,]
+training_clean<-training_clean[inTrain,]
+
+
+```
+
+Now lets see where we are at with respect with some particular variable
+
+```{r cache=TRUE}
+training_clean%>%
+select(user_name,cvtd_timestamp,raw_timestamp_part_1,raw_timestamp_part_2,num_window,new_window,roll_belt,classe)%>%
+mutate(
+raw_timestamp_part_1= as_datetime(as.numeric(raw_timestamp_part_1))
+)%>%
+ggplot(aes(x=raw_timestamp_part_1,y=roll_belt))+
+geom_point(aes(color=classe))+
+facet_wrap(user_name~.,scales = "free")
+```
+
+We can see a reflection of the exercize timeline here on the roll_belt sensor vs time, with classe as colors. It seems obvious then that all users executed all classes, which is how the exercize is specified. The user_name thus has no value as a predictor since we are trying to predict classe as a function of sensor data: the user that implemented has no bearing on this prediction.
+
+Time variables of timestamp and window number were also anlyzed:
+
+```{r cache=TRUE}
+
+training_clean%>%
+mutate(across(c(user_name,num_window),as_factor))->tc
+table(user=tc$user_name,wind=tc$num_window)%>%
+as_tibble()%>%
+rename(freq=n)%>%
+pivot_wider(
+names_from = "wind",
+values_from = "freq"
+)
+
+```
+None of the num_windows overlaps users. At the same time, timestamps provide the time when the exercize was started. raw_timestamp_1 is almost equivalent to cve_timestamp:
+
+```{r cache=TRUE}
+training_clean%>%
+    select(user_name,cvtd_timestamp,raw_timestamp_part_1,raw_timestamp_part_2,num_window)%>%
+    mutate(
+        raw_timestamp_part_1=as.numeric(raw_timestamp_part_1),
+        raw_timestamp_part_2=as.numeric(raw_timestamp_part_2),
+        rts1=lubridate::as_datetime(raw_timestamp_part_1),
+        cvtd_timestamp=lubridate::parse_date_time(cvtd_timestamp,orders="dmYHM")
+        )%>%
+    select(user_name,num_window,cvtd_timestamp,raw_timestamp_part_1,rts1,raw_timestamp_part_2)%>%
+    mutate(tdif=rts1-cvtd_timestamp)%>%
+    summarize(max(tdif))
+```
+But in general, there is little room to interpret the timestamps, as they are not thoroughly documented (for example, exercize duration would be interesting) and seem to only serve as identifiers for when was the exercize session held, thus they have no value as predictors.
+
+In any case, I dummified the window number, which seems to identify an exercize session by a particular user, removed the user_name, removed the num_window and proceeded from there:
+
+```{r cache=TRUE}
+dummies<-caret::dummyVars(classe~num_window,data=training_clean)
+training_clean<-bind_cols(
+                   predict(dummies,newdata=training_clean%>%                
+                  mutate(num_window=as_factor(num_window)))%>%as_tibble(),
+                  training_clean)%>%
+    select(-user_name,-num_window,-matches("timestamp"))
+```
+
+So we now have several paths before us. We can apply PCA so that the models are fed
+maximal variance variables in the form of PC's, or we pick models that do self 
+selection of variables, or we carefully pick variables by ourselves.
+
+For this last point, we can extract non-near-zero variances and select by correlation:
+
+```{r cache=TRUE}
+nzvvars<-nearZeroVar(training_clean,allowParallel = TRUE)
+training_clean_self_select<-training_clean%>%
+    select(-all_of(nzvvars))
+
+cors<-cor(training_clean_self_select%>%select(-classe))
+tocut<-findCorrelation(cors,cutoff = 0.8)
+
+```
+
+The following variables are highly correlated predictors with another, and thus will be droped:
+```{r cache=TRUE}
+training_clean_self_select%>%
+    select(-classe)%>%
+    select(all_of(tocut))%>%names()->cut_names
+cut_names
+```
+
+As such:
+```{r cache=TRUE}
+training_clean_self_select<-training_clean_self_select%>%
+  select(-all_of(cut_names))
+```
+
+Yet another strategy is to find linear combinations and then drop one of the 
+variables, but none are found. 
+```{r cache=TRUE}
+findLinearCombos(training_clean_self_select%>%select(-classe)%>%as.matrix())
+```
+
+We seem to be ready for some modeling.
+
+## Feature selection
+AS an exercize, I wanted to see about feature selection.
+```{r cache=TRUE}
+preds<-training_clean_self_select%>%select(-classe)
+cl<-training_clean_self_select%>%select(classe)
+rfprof<-rfe(x=as.data.frame(preds),
+            y=cl$classe,
+            sizes=c(10,15,20,35,40),
+            rfeControl = rfeControl(
+                functions=caret::rfFuncs,
+                method="cv",
+                number=3,
+                allowParallel = TRUE
+            ))
+```
+
+
+```{r cache=TRUE}
+rfprof
+```
+It prefers all 40 variables. Thus it seems we can get away with just modeling with
+all of them at least according to this simple algorithm.
+
+Now lets try a random forrest then:
+
+```{r cache=TRUE}
+rfmodel<-train(classe~.,
+                data=training_clean_self_select,
+                method="rf",
+                trControl=trainControl(
+                    method="cv",
+                    number=3
+                ))
+
+confusionMatrix(validation$classe,predict(rfmodel,validation))
+```
+
+Boom. Might be overfitted? Doubtful since it was tested on the validation set. Lets try a model that does prcomp.
+
+```{r cache=TRUE}
+rfmodelPAC<-train(classe~.,
+                data=training_clean_self_select,
+                method="rf",
+                trControl=trainControl(
+                    method="cv",
+                    number=3
+                ),
+                preProcess=c("center","scale","pca"))
+confusionMatrix(validation$classe,predict(rfmodelPAC,validation))
+```
+
+Now lets do the same, but with gbm.
+
+```{r cache=TRUE}
+gbmmodel<-train(classe~.,
+               data=training_clean_self_select,
+               method="gbm",
+               trControl=trainControl(
+                   method="cv",
+                   number=3
+               ))
+confusionMatrix(validation$classe,predict(gbmmodel,validation))
+```
+
+Its just not as good huh. Now with PCA:
+
+```{r cache=TRUE}
+gbmmodelPAC<-train(classe~.,
+                data=training_clean_self_select,
+                method="rf",
+                trControl=trainControl(
+                    method="cv",
+                    number=3
+                ),
+                preProcess=c("center","scale","pca"))
+confusionMatrix(validation$classe,predict(gbmmodelPAC,validation))
+```
+
+Still not as good. 
+
+## Conclussion
+
+Its enough to show that the random forrest model fares the best against the 
+validation dataset from the accuracy measures, so its the one i would keep.
+
